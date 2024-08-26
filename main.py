@@ -25,7 +25,7 @@ BOTM_INFO_VALUE = '_value_1sluz_281'
 BOTM_INFO_VALUE_NEG = '_negative_1sluz_299'
 
 
-def chunked(iterable, *, chunk_size=None, num_chunks=None):
+def chunked(iterable: list, *, chunk_size=None, num_chunks=None) -> list[list]:
     if chunk_size is not None and num_chunks is not None:
         raise ValueError('Specify either chunk_size or num_chunks, not both.')
 
@@ -45,7 +45,7 @@ def chunked(iterable, *, chunk_size=None, num_chunks=None):
     raise ValueError('You must specify either chunk_size or num_chunks.')
 
 
-def convert_dict_values(input_dict):
+def convert_dict_values(input_dict: dict) -> dict:
     output_dict = {}
 
     for key, value in input_dict.items():
@@ -135,7 +135,7 @@ async def process_tab(ids_to_parse: list, context: BrowserContext) -> list[dict]
         print(f'Error processing ids {ids_to_parse}: {e}')
 
 
-async def run(ids_to_parse: list, max_tabs: int, headless: bool = False):
+async def run(ids_to_parse: list, max_tabs: int, headless: bool = False) -> list[dict]:
     lock = asyncio.Lock()
     regions_data = list()
     async with async_playwright() as p:
@@ -154,7 +154,7 @@ async def run(ids_to_parse: list, max_tabs: int, headless: bool = False):
     return regions_data
 
 
-def worker(chunk, max_tabs, headless, return_list):
+def worker(chunk: list, max_tabs: int, headless: bool, return_list) -> None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     result = loop.run_until_complete(run(chunk, max_tabs, headless))
@@ -224,8 +224,3 @@ if __name__ == '__main__':
     NUM_TABS = 4
     HEADLESS = True
     main(NUM_PROCESSES, NUM_TABS, HEADLESS)
-
-# p=1, t=3, urls=12;  28.51s
-# p=2, t=3, urls=12;  25.83s
-# p=2, t=4, urls=110; 75.56s
-# p=2, t=4, urls=111; 70.54s - 0.64s/region
