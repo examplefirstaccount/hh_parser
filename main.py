@@ -1,13 +1,48 @@
-import multiprocessing as mp
+import asyncio
 import re
 import time
+from multiprocessing import Process, Manager
 
 import pandas as pd
-import undetected_chromedriver as uc
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as ec
-from selenium.webdriver.support.ui import WebDriverWait
+from playwright.async_api import async_playwright, BrowserContext, Page
+
+
+LINK = 'https://stats.hh.ru/'
+REGION_COLUMN_NAME = 'Субъект'
+
+REGIONS_WRAP = '_regions_39f95_341'
+REGION_EL = '_region_39f95_312'
+
+SIDE_INFO_WRAP = '_regionInfo_1fsky_120'
+SIDE_INFO_ITEM = '_infoItem_1fsky_181'
+SIDE_INFO_TITLE = '_infoTitle_1fsky_192'
+SIDE_INFO_VALUE = '_infoValue_1fsky_207'
+
+BOTM_INFO_WRAP = '_badgesContainer_171fz_14'
+BOTM_INFO_ITEM = '_shortInfo_1sluz_183'
+BOTM_INFO_TITLE = '_text_1dgql_1'
+BOTM_INFO_VALUE = '_value_1sluz_281'
+BOTM_INFO_VALUE_NEG = '_negative_1sluz_299'
+
+
+def chunked(iterable, *, chunk_size=None, num_chunks=None):
+    if chunk_size is not None and num_chunks is not None:
+        raise ValueError('Specify either chunk_size or num_chunks, not both.')
+
+    if chunk_size is not None:
+        if chunk_size <= 0:
+            raise ValueError('chunk_size must be a positive integer.')
+        return [iterable[i:i + chunk_size] for i in range(0, len(iterable), chunk_size)]
+
+    if num_chunks is not None:
+        if num_chunks <= 0:
+            raise ValueError('num_chunks must be a positive integer.')
+        sublists = [[] for _ in range(num_chunks)]
+        for i, item in enumerate(iterable):
+            sublists[i % num_chunks].append(item)
+        return sublists
+
+    raise ValueError('You must specify either chunk_size or num_chunks.')
 
 
 def convert_dict_values(input_dict):
@@ -33,105 +68,137 @@ def convert_dict_values(input_dict):
     return output_dict
 
 
-class Worker(mp.Process):
-    def __init__(self, ids_to_parse, name, result_list, stop_ev=mp.Event(), daemon=True):
-        self.ids_to_parse = ids_to_parse
-        self.result_list = result_list
-        self.driver = None
-        self.stop_ev = stop_ev
-        super().__init__(name=name, daemon=daemon)
+async def get_elements_to_parse() -> list:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
 
-    def scroll_and_click(self, element):
-        actions = ActionChains(self.driver)
-        self.driver.execute_script("arguments[0].scrollIntoViewIfNeeded();", element)
-        WebDriverWait(self.driver, 10).until(ec.element_to_be_clickable(element))
-        actions.move_to_element(element).click().perform()
+        await page.goto(LINK)
+        container = await page.wait_for_selector(f'.{REGIONS_WRAP}')
+        elements = await container.query_selector_all(f'.{REGION_EL}')
+        element_ids = [await element.get_attribute('id') for element in elements if await element.get_attribute('id')]
 
-    def get_badges_data(self, wrapper_cls: str, item_cls: str, title_cls: str, value_cls: str) -> dict:
-        try:
-            WebDriverWait(self.driver, 30).until(lambda d: d.find_element(By.CLASS_NAME, value_cls).text != '-')
-            badges_wrap = self.driver.find_element(By.CLASS_NAME, wrapper_cls)
-            badges = badges_wrap.find_elements(By.CLASS_NAME, item_cls)
+        await browser.close()
 
-            data = dict()
-            for badge in badges:
-                key = badge.find_element(By.CLASS_NAME, title_cls).text
-                value = badge.find_element(By.CLASS_NAME, value_cls).text
-                data[key] = value
-            return convert_dict_values(data)
-        except Exception as e:
-            print(f"Error parsing badge: {e}")
+    return element_ids
 
-    def run(self):
-        self.driver = uc.Chrome(user_multi_procs=True)
-        self.driver.get(LINK)
-        WebDriverWait(self.driver, 30).until(ec.presence_of_element_located((By.CLASS_NAME, ELEMENT_CLASS)))
 
-        for el_id in self.ids_to_parse:
-            element = self.driver.find_element(By.ID, el_id)
-            region = element.text
-            data = {REGION_COL: region}
+async def get_badges_data(page: Page, wrapper_cls: str, item_cls: str, title_cls: str, value_cls: str) -> dict:
+    try:
+        await page.wait_for_selector(f'.{value_cls}', state='attached')
+        await page.wait_for_function(
+            f"document.getElementsByClassName('{value_cls}')[0].innerText !== '-'"
+        )
+        badges_wrap = await page.query_selector(f'.{wrapper_cls}')
+        badges = await badges_wrap.query_selector_all(f'.{item_cls}')
+
+        data = dict()
+        for badge in badges:
+            key = await (await badge.query_selector(f'.{title_cls}')).inner_text()
+            value = await (await badge.query_selector(f'.{value_cls}')).inner_text()
+            data[key] = value
+        return convert_dict_values(data)
+    except Exception as e:
+        print(f'Error parsing badge: {e}')
+
+
+async def process_tab(ids_to_parse: list, context: BrowserContext) -> list[dict]:
+    page = await context.new_page()
+    try:
+        await page.goto(LINK)
+        await page.wait_for_selector(f'.{REGION_EL}')
+
+        regions_data = list()
+        for el_id in ids_to_parse:
+            element = page.locator(f"[id='{el_id}']").first
+            region = await element.inner_text()
+            data = {REGION_COLUMN_NAME: region}
             try:
-                self.scroll_and_click(element)
-                data.update(self.get_badges_data(REGION_INFO_WRAP, INFO_ITEM, INFO_TITLE, INFO_VALUE))
-                data.update(self.get_badges_data(BADGES_WRAP, BADGE, BADGE_TITLE, BADGE_VALUE))
-                self.result_list.append(data)
-                print(f"Successfully parsed data for {region}")
+                await element.scroll_into_view_if_needed()
+                await element.click()
+
+                data.update(await get_badges_data(page, SIDE_INFO_WRAP, SIDE_INFO_ITEM,
+                                                  SIDE_INFO_TITLE, SIDE_INFO_VALUE))
+
+                data.update(await get_badges_data(page, BOTM_INFO_WRAP, BOTM_INFO_ITEM,
+                                                  BOTM_INFO_TITLE, BOTM_INFO_VALUE))
+
+                regions_data.append(data)
+                print(f'Successfully parsed data for {region}')
             except Exception as e:
-                print(f"Error parsing data for {region}: {e}")
+                print(f'Error processing region {region}: {e}')
 
-            time.sleep(0.5)
+        return regions_data
 
-    def start(self) -> None:
-        super().start()
-
-
-LINK = 'https://stats.hh.ru/'
-REGION_COL = 'Субъект'
-
-CONTAINER_CLASS = "_regions_39f95_341"
-ELEMENT_CLASS = "_region_39f95_312"
-
-REGION_INFO_WRAP = '_regionInfo_1fsky_120'
-INFO_ITEM = '_infoItem_1fsky_181'
-INFO_TITLE = '_infoTitle_1fsky_192'
-INFO_VALUE = '_infoValue_1fsky_207'
-
-BADGES_WRAP = '_badgesContainer_171fz_14'
-BADGE = '_shortInfo_1sluz_183'
-BADGE_TITLE = '_text_1dgql_1'
-BADGE_VALUE = '_value_1sluz_281'
-BADGE_VALUE_NEG = '_negative_1sluz_299'
+    except Exception as e:
+        print(f'Error processing ids {ids_to_parse}: {e}')
 
 
-def main(num_processes: int):
+async def run(ids_to_parse: list, max_tabs: int, headless: bool = False):
+    lock = asyncio.Lock()
+    regions_data = list()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        context = await browser.new_context()
+
+        ids_chunked = chunked(ids_to_parse, num_chunks=max_tabs)
+        tasks = [process_tab(chunk, context) for chunk in ids_chunked]
+        for task_future in asyncio.as_completed(tasks):
+            chunk_regions_data = await task_future
+            async with lock:
+                regions_data.extend(chunk_regions_data)
+
+        await browser.close()
+
+    return regions_data
+
+
+def worker(chunk, max_tabs, headless, return_list):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    result = loop.run_until_complete(run(chunk, max_tabs, headless))
+    return_list.extend(result)
+
+
+def main(num_processes: int, num_tabs: int, headless: bool):
     # Get total number of elements to parse
-    driver = uc.Chrome()
-    driver.get(LINK)
-    container = WebDriverWait(driver, 30).until(ec.presence_of_element_located((By.CLASS_NAME, CONTAINER_CLASS)))
-    elements = container.find_elements(By.CLASS_NAME, ELEMENT_CLASS)
-    element_ids = [element.get_attribute('id') for element in elements if element.get_attribute('id')]
-    total_elements = len(elements)
-    driver.quit()
+    element_ids = asyncio.run(get_elements_to_parse())
+    total_elements = len(element_ids)
+    print(f'Total number of elements to parse: {total_elements}')
 
     # Set up processes
-    workers = []
-    chunk_size = total_elements // num_processes
-    result_list = mp.Manager().list()
-
-    for i in range(num_processes):
-        start_idx = i * chunk_size
-        end_idx = (i + 1) * chunk_size if i != num_processes - 1 else total_elements
-        to_parse = element_ids[start_idx:end_idx]
-        worker = Worker(name=f'worker-{i+1}', ids_to_parse=to_parse, result_list=result_list)
-        workers.append(worker)
-
     start_time = time.time()
-    for w in workers:
-        w.start()
+    ids_chunked = chunked(element_ids, num_chunks=num_processes)
 
-    for w in workers:
-        w.join()
+    # Processes Variant 1.
+    manager = Manager()
+    return_list = manager.list()
+    processes = []
+
+    for chunk in ids_chunked:
+        process = Process(target=worker, args=(chunk, num_tabs, headless, return_list))
+        processes.append(process)
+        process.start()
+
+    for process in processes:
+        process.join()
+
+    all_results = list(return_list)
+
+    # Processes Variant 2.
+    # with ProcessPoolExecutor() as executor:
+    #     loop = asyncio.get_event_loop()
+    #     futures = [
+    #         loop.run_in_executor(
+    #             executor,
+    #             asyncio.run,
+    #             run(chunk, num_tabs, headless)
+    #         )
+    #         for chunk in ids_chunked
+    #     ]
+    #     results = loop.run_until_complete(asyncio.gather(*futures))
+    # all_results = [item for sublist in results for item in sublist]
 
     # End time for the entire program
     end_time = time.time()
@@ -142,16 +209,23 @@ def main(num_processes: int):
     avg_region_time = total_time / total_elements
 
     # Print the time statistics
-    print(f"Total time for the program: {total_time:.2f} seconds")
-    print(f"Average time per thread: {avg_thread_time:.2f} seconds")
-    print(f"Average time per region: {avg_region_time:.2f} seconds")
+    print(f'Total time for the program: {total_time:.2f} seconds')
+    print(f'Average time per thread: {avg_thread_time:.2f} seconds')
+    print(f'Average time per region: {avg_region_time:.2f} seconds')
 
     # Convert the result list to a DataFrame and save it to an Excel file
-    df = pd.DataFrame(list(result_list))
-    df.to_excel('parsed_data.xlsx', index=False)
-    print("Data saved to parsed_data.xlsx")
+    df = pd.DataFrame(all_results)
+    df.sort_values(by=REGION_COLUMN_NAME).to_excel('data.xlsx', index=False)
+    print('Data saved to data.xlsx')
 
 
 if __name__ == '__main__':
-    NUM_PROCESSES = 1
-    main(NUM_PROCESSES)
+    NUM_PROCESSES = 2
+    NUM_TABS = 4
+    HEADLESS = True
+    main(NUM_PROCESSES, NUM_TABS, HEADLESS)
+
+# p=1, t=3, urls=12;  28.51s
+# p=2, t=3, urls=12;  25.83s
+# p=2, t=4, urls=110; 75.56s
+# p=2, t=4, urls=111; 70.54s - 0.64s/region
